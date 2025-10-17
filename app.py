@@ -6,6 +6,7 @@ from github import Github, Auth, GithubException
 import re
 from typing import Any, Dict, List, Optional
 from dotenv import load_dotenv
+import threading
 
 # Load environment variables from .env file
 load_dotenv()
@@ -255,50 +256,34 @@ def _upsert_file(repo, path: str, message: str, content: str) -> None:
         repo.create_file(path, message, content)
 
 
-def wait_for_pages_deployment(pages_url: str, max_wait: int = 180) -> bool:
+def verify_pages_async(pages_url: str, nonce: str, evaluation_url: str, notification: dict, max_wait: int = 120):
     """
-    Wait for GitHub Pages to be accessible and return True if successful.
-    
-    Args:
-        pages_url: The GitHub Pages URL to check
-        max_wait: Maximum time to wait in seconds (default: 180 = 3 minutes)
-    
-    Returns:
-        bool: True if Pages is accessible, False if timeout exceeded
+    Background thread to verify Pages deployment and notify evaluator.
+    Doesn't block the main request.
     """
-    print(f"Verifying Pages deployment at {pages_url}...")
+    print(f"[BG] Starting Pages verification in background thread...")
     
-    intervals = 10  # Check every 10 seconds
-    max_attempts = max_wait // intervals
-    
-    for attempt in range(max_attempts):
+    for attempt in range(max_wait // 10):
         try:
             response = requests.get(
                 pages_url, 
-                timeout=10, 
+                timeout=10,
                 allow_redirects=True,
-                headers={'User-Agent': 'Mozilla/5.0'}  # Some servers require user agent
+                headers={'User-Agent': 'Mozilla/5.0'}
             )
             
-            if response.status_code == 200:
-                # Verify it's not a 404 page that returns 200
-                content_length = len(response.content)
-                if content_length > 100:  # Should have actual content
-                    print(f"✓ Pages deployed and accessible ({attempt * intervals}s)")
-                    return True
-                else:
-                    print(f"  Pages responding but content too small, waiting...")
-                    
-        except requests.exceptions.RequestException as e:
-            # Expected during deployment, continue waiting
+            if response.status_code == 200 and len(response.content) > 100:
+                print(f"[BG] Pages verified as accessible at {(attempt * 10)}s")
+                notification["pages_verified"] = True
+                break
+        except requests.exceptions.RequestException:
             pass
         
-        if attempt < max_attempts - 1:
-            print(f"  Waiting for deployment... ({(attempt + 1) * intervals}s)")
-            time.sleep(intervals)
+        if attempt < (max_wait // 10) - 1:
+            time.sleep(10)
     
-    print(f"⚠ Pages deployment not verified after {max_wait}s")
-    return False
+    print(f"[BG] Notifying evaluator with final status...")
+    notify_evaluator(evaluation_url, notification)
 
 
 def create_github_repo(
@@ -422,9 +407,6 @@ SOFTWARE."""
             print("⚠ GitHub Pages may need manual activation")
     else:
         print("✓ GitHub Pages already configured (Round 2 update)")
-        # Trigger a rebuild by hitting the Pages API
-        print("✓ Waiting for GitHub Pages to rebuild...")
-        time.sleep(3)
     
     return {
         "repo_url": repo.html_url,
@@ -537,15 +519,6 @@ def deploy_app():
         print(f"✓ Commit SHA: {github_info['commit_sha']}")
         print(f"✓ Pages URL: {github_info['pages_url']}")
         
-        # Wait for GitHub Pages to deploy and verify accessibility
-        print("\nWaiting for GitHub Pages to deploy...")
-        wait_time = 600 if round_num == 1 else 180  # 10 min for first deploy, 3 min for updates
-        pages_ready = wait_for_pages_deployment(github_info['pages_url'], max_wait=wait_time)
-        
-        if not pages_ready:
-            print(f"⚠ WARNING: Pages may not be ready after {wait_time}s, but continuing anyway")
-            print("   The evaluator may need to retry or wait longer for the page to be accessible")
-        
         # Prepare notification payload
         notification = {
             "email": email,
@@ -555,29 +528,30 @@ def deploy_app():
             "repo_url": github_info['repo_url'],
             "commit_sha": github_info['commit_sha'],
             "pages_url": github_info['pages_url'],
-            "pages_verified": pages_ready  # Include verification status
+            "pages_verified": False  # Will be updated in background
         }
         
-        # Notify evaluator
-        print("\nNotifying evaluator...")
-        result = notify_evaluator(evaluation_url, notification)
+        print("✓ Deployment complete. Verifying Pages in background...")
         
-        if result.get('success'):
-            print(f"✓ Evaluator notified successfully")
-        else:
-            print(f"⚠ Evaluator notification failed: {result.get('error')}")
+        # Start background thread to verify Pages and notify (doesn't block the request)
+        bg_thread = threading.Thread(
+            target=verify_pages_async,
+            args=(github_info['pages_url'], nonce, evaluation_url, notification, 120),
+            daemon=True
+        )
+        bg_thread.start()
         
         print("=" * 70)
-        print(f"✅ Request completed successfully for {task} (Round {round_num})")
+        print(f"✅ Request processed successfully for {task} (Round {round_num})")
         print("=" * 70)
         print()
         
+        # Return immediately
         return jsonify({
             "status": "success",
             "repo_url": github_info['repo_url'],
             "pages_url": github_info['pages_url'],
-            "pages_verified": pages_ready,
-            "evaluator_response": result
+            "message": "Deployment in progress. Verifying and notifying evaluator in background."
         }), 200
         
     except Exception as e:
