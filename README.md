@@ -1,6 +1,5 @@
 # LLM Code Deployment Project
 
-**Team: khaana Kab?**
 
 Automated app generation and deployment system that receives requests, generates code using Claude AI, deploys to GitHub Pages, and notifies evaluators.
 
@@ -206,9 +205,6 @@ For issues:
 4. Verify all credentials
 5. Check GitHub API limits
 
-## 🏆 Team
-
-**khaana Kab?** - Engineering problem solvers
 
 ## 📄 License
 
