@@ -146,9 +146,6 @@ Health check endpoint.
 - **Deployment**: Gunicorn for production server
 - **Hosting**: Render/Railway/Vercel compatible
 
-## 🎓 Course Context
-
-This project is part of a "vibe coding" course focused on practical, LLM-assisted development. The goal is to build systems that leverage AI to automate complex workflows.
 
 ## 🐛 Troubleshooting
 
@@ -211,5 +208,3 @@ For issues:
 This project generates apps with MIT License.
 
 ---
-
-**Built with ❤️ and Claude AI**
