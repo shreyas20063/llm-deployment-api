@@ -521,12 +521,12 @@ def deploy_app():
         print("✓ Deployment complete. Will notify evaluator after 3-minute delay...")
         
         # Start background thread with 3-minute delay (doesn't block the request)
- #       bg_thread = threading.Thread(
- #           target=verify_pages_async,
- #           args=(github_info['pages_url'], nonce, evaluation_url, notification, 180),
- #           daemon=True
- #       )
- #       bg_thread.start()
+        bg_thread = threading.Thread(
+            target=verify_pages_async,
+            args=(github_info['pages_url'], nonce, evaluation_url, notification, 180),
+            daemon=True
+        )
+        bg_thread.start()
         
         print("=" * 70)
         print(f"✅ Request processed successfully for {task} (Round {round_num})")
