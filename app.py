@@ -24,6 +24,10 @@ _github_client: Optional[Github] = None
 # AI Pipe configuration
 AIPIPE_BASE_URL = "https://aipipe.org/openrouter/v1/chat/completions"
 
+# CRITICAL: Maximum total time from request start to notification (in seconds)
+MAX_TOTAL_TIME = 9 * 60  # 9 minutes (1 min safety buffer)
+NOTIFICATION_BUFFER = 20  # Reserve 20s for notification attempts
+
 
 class ConfigurationError(Exception):
     """Raised when required environment configuration is missing."""
@@ -151,6 +155,7 @@ Return ONLY the complete MODIFIED HTML code, nothing else. No explanations, no m
 Start directly with <!DOCTYPE html>"""
 
     # Call AI Pipe with OpenRouter (Claude via OpenRouter)
+    # Reduced timeout to ensure we don't exceed our time budget
     response = requests.post(
         AIPIPE_BASE_URL,
         headers={
@@ -162,7 +167,7 @@ Start directly with <!DOCTYPE html>"""
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": 8000
         },
-        timeout=120
+        timeout=90  # Reduced from 120 to 90 seconds
     )
     
     response.raise_for_status()
@@ -256,21 +261,44 @@ def _upsert_file(repo, path: str, message: str, content: str) -> None:
         repo.create_file(path, message, content)
 
 
-def verify_pages_async(pages_url: str, nonce: str, evaluation_url: str, notification: dict, delay_seconds: int = 180):
+def verify_pages_async(pages_url: str, nonce: str, evaluation_url: str, notification: dict, start_time: float, deadline: float):
     """
     Background thread to wait for Pages deployment and notify evaluator.
-    Doesn't block the main request. Waits for a fixed delay (default 3 minutes).
+    Uses a hard deadline to ensure notification happens before MAX_TOTAL_TIME.
     """
-    print(f"[BG] Starting {delay_seconds}s delay before notifying evaluator...")
-    
-    # Wait for the specified delay
-    time.sleep(delay_seconds)
-    
-    # Mark as verified after delay
-    notification["pages_verified"] = True
-    
-    print(f"[BG] Delay complete. Notifying evaluator...")
-    notify_evaluator(evaluation_url, notification)
+    try:
+        # Calculate how much time we can wait
+        current_time = time.time()
+        time_remaining = deadline - current_time
+        
+        if time_remaining > 5:  # Only wait if we have more than 5 seconds
+            wait_time = max(5, time_remaining)  # Wait at least 5 seconds for Pages to deploy
+            print(f"[BG] Waiting {wait_time:.1f}s for Pages deployment (deadline in {deadline - current_time:.1f}s)...")
+            time.sleep(wait_time)
+        else:
+            print(f"[BG] Close to deadline ({time_remaining:.1f}s remaining), notifying immediately...")
+        
+        # Check if we're past the deadline
+        if time.time() >= deadline:
+            print(f"[BG] ⚠️ Deadline reached! Notifying immediately...")
+        
+        # Mark as verified
+        notification["pages_verified"] = True
+        
+        elapsed = time.time() - start_time
+        print(f"[BG] Notifying evaluator (total elapsed: {elapsed:.1f}s)...")
+        
+        # Notify with minimal retries to stay under deadline
+        result = notify_evaluator(evaluation_url, notification, max_retries=2)
+        
+        final_elapsed = time.time() - start_time
+        print(f"[BG] ✓ Notification complete (total time: {final_elapsed:.1f}s / {MAX_TOTAL_TIME}s budget)")
+        
+        if not result["success"]:
+            print(f"[BG] ⚠️ Warning: Notification may have failed but we stayed under time limit")
+            
+    except Exception as e:
+        print(f"[BG] ❌ Error in background thread: {e}")
 
 
 def create_github_repo(
@@ -351,11 +379,11 @@ SOFTWARE."""
     if round_num == 1:
         print("Enabling GitHub Pages...")
         pages_enabled = False
-        for attempt in range(3):
+        for attempt in range(2):  # Reduced from 3 to 2 attempts
             try:
                 # Wait a moment for files to be committed
                 if attempt > 0:
-                    time.sleep(3)
+                    time.sleep(2)  # Reduced from 3 to 2
                 
                 # Use GitHub REST API to enable Pages
                 pages_url = f"https://api.github.com/repos/{github_username}/{repo_name}/pages"
@@ -370,7 +398,7 @@ SOFTWARE."""
                     }
                 }
                 
-                response = requests.post(pages_url, headers=headers, json=data, timeout=20)
+                response = requests.post(pages_url, headers=headers, json=data, timeout=15)  # Reduced from 20 to 15
                 
                 if response.status_code == 201:
                     print("✓ GitHub Pages enabled successfully")
@@ -381,13 +409,13 @@ SOFTWARE."""
                     pages_enabled = True
                     break
                 else:
-                    print(f"Attempt {attempt + 1}/3 failed: HTTP {response.status_code}")
-                    if attempt == 2:
+                    print(f"Attempt {attempt + 1}/2 failed: HTTP {response.status_code}")
+                    if attempt == 1:
                         print(f"⚠ Warning: {response.text}")
                         
             except Exception as e:
-                print(f"Attempt {attempt + 1}/3 to enable Pages failed: {e}")
-                if attempt == 2:
+                print(f"Attempt {attempt + 1}/2 to enable Pages failed: {e}")
+                if attempt == 1:
                     print("⚠ Warning: Could not enable Pages automatically. Enable manually in repo settings.")
         
         if not pages_enabled:
@@ -401,8 +429,8 @@ SOFTWARE."""
         "pages_url": f"https://{github_username}.github.io/{repo_name}/"
     }
 
-def notify_evaluator(evaluation_url, payload, max_retries=5):
-    """POST to evaluation URL with exponential backoff"""
+def notify_evaluator(evaluation_url, payload, max_retries=2):
+    """POST to evaluation URL with minimal retries (time-constrained)"""
     
     for attempt in range(max_retries):
         try:
@@ -410,24 +438,32 @@ def notify_evaluator(evaluation_url, payload, max_retries=5):
                 evaluation_url,
                 json=payload,
                 headers={"Content-Type": "application/json"},
-                timeout=30
+                timeout=10  # Reduced from 30 to 10 seconds
             )
             
             if response.status_code == 200:
+                print(f"✓ Evaluator notified successfully")
                 return {"success": True, "response": response.json()}
+            else:
+                print(f"⚠ Evaluator returned status {response.status_code}")
             
         except Exception as e:
-            print(f"Attempt {attempt + 1} failed: {e}")
+            print(f"Attempt {attempt + 1}/{max_retries} failed: {e}")
         
-        # Exponential backoff: 1, 2, 4, 8, 16 seconds
+        # Short backoff: 2 seconds only
         if attempt < max_retries - 1:
-            time.sleep(2 ** attempt)
+            time.sleep(2)
     
+    print(f"❌ Failed to notify evaluator after {max_retries} attempts")
     return {"success": False, "error": "Max retries exceeded"}
 
 @app.route('/api/deploy', methods=['POST'])
 def deploy_app():
     """Main endpoint that handles app deployment requests"""
+    
+    # Record start time and calculate hard deadline
+    start_time = time.time()
+    deadline = start_time + MAX_TOTAL_TIME - NOTIFICATION_BUFFER
     
     try:
         config = get_config()
@@ -467,6 +503,8 @@ def deploy_app():
         
         print("=" * 70)
         print(f"📥 Processing request for {email}, task: {task}, round: {round_num}")
+        print(f"⏱️  Start: {time.strftime('%H:%M:%S', time.localtime(start_time))}")
+        print(f"⏱️  Deadline: {time.strftime('%H:%M:%S', time.localtime(deadline))} ({MAX_TOTAL_TIME/60:.1f}min budget)")
         print("=" * 70)
         
         github_client = get_github_client(config["github_token"])
@@ -481,9 +519,17 @@ def deploy_app():
             else:
                 print("⚠ No existing code found, generating from scratch")
 
+        # Check if we're running out of time
+        if time.time() >= deadline:
+            raise RuntimeError("Processing exceeded time budget before LLM generation")
+
         # Generate app code using LLM
         print(f"Generating app code (Round {round_num})...")
         html_code = generate_app_code(brief, checks, attachments, config["aipipe_token"], round_num, existing_code)
+        
+        # Check if we're running out of time
+        if time.time() >= deadline:
+            raise RuntimeError("Processing exceeded time budget after LLM generation")
         
         # Generate README
         print("Generating README...")
@@ -506,6 +552,12 @@ def deploy_app():
         print(f"✓ Commit SHA: {github_info['commit_sha']}")
         print(f"✓ Pages URL: {github_info['pages_url']}")
         
+        # Calculate elapsed time
+        elapsed_time = time.time() - start_time
+        time_remaining = deadline - time.time()
+        print(f"⏱️  Processing completed in {elapsed_time:.1f}s")
+        print(f"⏱️  Time remaining until deadline: {time_remaining:.1f}s")
+        
         # Prepare notification payload
         notification = {
             "email": email,
@@ -518,18 +570,19 @@ def deploy_app():
             "pages_verified": False  # Will be updated in background
         }
         
-        print("✓ Deployment complete. Will notify evaluator after 3-minute delay...")
+        print(f"✓ Starting background notification thread with hard deadline...")
         
-        # Start background thread with 3-minute delay (doesn't block the request)
+        # Start background thread with hard deadline
         bg_thread = threading.Thread(
             target=verify_pages_async,
-            args=(github_info['pages_url'], nonce, evaluation_url, notification, 180),
+            args=(github_info['pages_url'], nonce, evaluation_url, notification, start_time, deadline),
             daemon=True
         )
         bg_thread.start()
         
         print("=" * 70)
         print(f"✅ Request processed successfully for {task} (Round {round_num})")
+        print(f"⏱️  Total budget: {MAX_TOTAL_TIME/60:.1f} minutes")
         print("=" * 70)
         print()
         
@@ -538,7 +591,7 @@ def deploy_app():
             "status": "success",
             "repo_url": github_info['repo_url'],
             "pages_url": github_info['pages_url'],
-            "message": "Deployment complete. Will notify evaluator after 3-minute delay."
+            "message": f"Deployment complete. Notification will be sent within {MAX_TOTAL_TIME/60:.1f} minutes."
         }), 200
         
     except Exception as e:
@@ -569,6 +622,8 @@ if __name__ == '__main__':
     print(f"Secret: {mask_secret(config['secret'])} (configured)")
     print(f"AI Pipe Token: {mask_secret(config['aipipe_token'])} (configured)")
     print(f"GitHub Token: {mask_secret(config['github_token'])} (configured)")
+    print(f"⏱️  Maximum total time: {MAX_TOTAL_TIME/60:.1f} minutes")
+    print(f"⏱️  Notification buffer: {NOTIFICATION_BUFFER}s")
     print("=" * 70)
     print()
     
