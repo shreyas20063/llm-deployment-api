@@ -71,7 +71,17 @@ def verify_secret(request_data: Dict[str, Any], expected_secret: str) -> bool:
     """Verify the secret matches"""
     return request_data.get('secret') == expected_secret
 
-def generate_app_code(brief: str, checks: List[str], attachments: Optional[List[Dict[str, Any]]], aipipe_token: str) -> str:
+def get_existing_code(task_id: str, github_username: str, github_client: Github) -> Optional[str]:
+    """Fetch existing index.html from the repository if it exists"""
+    try:
+        user = github_client.get_user()
+        repo = user.get_repo(task_id)
+        contents = repo.get_contents("index.html")
+        return contents.decoded_content.decode("utf-8")
+    except GithubException:
+        return None
+
+def generate_app_code(brief: str, checks: List[str], attachments: Optional[List[Dict[str, Any]]], aipipe_token: str, round_num: int = 1, existing_code: Optional[str] = None) -> str:
     """Use Claude via AI Pipe to generate the complete app code"""
     
     # Prepare attachment info for Claude
@@ -83,8 +93,10 @@ def generate_app_code(brief: str, checks: List[str], attachments: Optional[List[
             url = att.get('url', 'N/A')
             attachment_info += f"- {name}: {str(url)[:100]}...\n"
     
-    # Build the prompt
-    prompt = f"""You are an expert web developer. Generate a COMPLETE, PRODUCTION-READY single HTML file for this app.
+    # Different prompts for round 1 vs round 2
+    if round_num == 1 or not existing_code:
+        # Round 1: Generate new app from scratch
+        prompt = f"""You are an expert web developer. Generate a COMPLETE, PRODUCTION-READY single HTML file for this app.
 
 REQUIREMENTS:
 {brief}
@@ -105,6 +117,36 @@ CRITICAL REQUIREMENTS:
 
 OUTPUT FORMAT:
 Return ONLY the complete HTML code, nothing else. No explanations, no markdown code blocks.
+Start directly with <!DOCTYPE html>"""
+    else:
+        # Round 2: Modify existing code
+        prompt = f"""You are an expert web developer. MODIFY the existing HTML application to meet the new requirements.
+
+EXISTING CODE:
+```html
+{existing_code}
+```
+
+NEW REQUIREMENTS:
+{brief}
+
+EVALUATION CHECKS:
+{chr(10).join('- ' + check for check in checks)}
+
+{attachment_info}
+
+CRITICAL REQUIREMENTS:
+1. MODIFY the existing code, don't start from scratch
+2. Keep all existing functionality that still works
+3. Everything must remain in ONE HTML file (inline CSS and JavaScript)
+4. Use CDN links for external libraries
+5. Handle attachments by decoding data URIs in JavaScript
+6. Follow all new checks exactly
+7. Make it clean, professional, and production-ready
+8. Add error handling and user feedback
+
+OUTPUT FORMAT:
+Return ONLY the complete MODIFIED HTML code, nothing else. No explanations, no markdown code blocks.
 Start directly with <!DOCTYPE html>"""
 
     # Call AI Pipe with OpenRouter (Claude via OpenRouter)
@@ -145,14 +187,16 @@ Start directly with <!DOCTYPE html>"""
     
     return code
 
-def generate_readme(task_id: str, brief: str, checks: List[str], repo_url: str, github_username: str) -> str:
+def generate_readme(task_id: str, brief: str, checks: List[str], repo_url: str, github_username: str, round_num: int = 1) -> str:
     """Generate a professional README.md"""
+    
+    round_info = f"\n\n## Round {round_num}\n" if round_num > 1 else ""
     
     readme = f"""# {task_id}
 
 ## Overview
 This is an automated web application generated to fulfill the following requirements.
-
+{round_info}
 ## Requirements
 {brief}
 
@@ -211,6 +255,52 @@ def _upsert_file(repo, path: str, message: str, content: str) -> None:
         repo.create_file(path, message, content)
 
 
+def wait_for_pages_deployment(pages_url: str, max_wait: int = 180) -> bool:
+    """
+    Wait for GitHub Pages to be accessible and return True if successful.
+    
+    Args:
+        pages_url: The GitHub Pages URL to check
+        max_wait: Maximum time to wait in seconds (default: 180 = 3 minutes)
+    
+    Returns:
+        bool: True if Pages is accessible, False if timeout exceeded
+    """
+    print(f"Verifying Pages deployment at {pages_url}...")
+    
+    intervals = 10  # Check every 10 seconds
+    max_attempts = max_wait // intervals
+    
+    for attempt in range(max_attempts):
+        try:
+            response = requests.get(
+                pages_url, 
+                timeout=10, 
+                allow_redirects=True,
+                headers={'User-Agent': 'Mozilla/5.0'}  # Some servers require user agent
+            )
+            
+            if response.status_code == 200:
+                # Verify it's not a 404 page that returns 200
+                content_length = len(response.content)
+                if content_length > 100:  # Should have actual content
+                    print(f"✓ Pages deployed and accessible ({attempt * intervals}s)")
+                    return True
+                else:
+                    print(f"  Pages responding but content too small, waiting...")
+                    
+        except requests.exceptions.RequestException as e:
+            # Expected during deployment, continue waiting
+            pass
+        
+        if attempt < max_attempts - 1:
+            print(f"  Waiting for deployment... ({(attempt + 1) * intervals}s)")
+            time.sleep(intervals)
+    
+    print(f"⚠ Pages deployment not verified after {max_wait}s")
+    return False
+
+
 def create_github_repo(
     task_id: str,
     html_code: str,
@@ -218,13 +308,14 @@ def create_github_repo(
     github_username: str,
     github_token: str,
     github_client: Github,
+    round_num: int = 1,
 ):
     """Create repo, push code, enable Pages"""
     
     user = github_client.get_user()
     repo_name = f"{task_id}"
     
-    # Create repo
+    # Create repo (or get existing)
     try:
         repo = user.create_repo(
             repo_name,
@@ -232,13 +323,15 @@ def create_github_repo(
             private=False,
             auto_init=False
         )
+        print(f"✓ Created new repo: {repo_name}")
     except GithubException as exc:
         if exc.status in (422, 403):
             repo = user.get_repo(repo_name)
+            print(f"✓ Using existing repo: {repo_name}")
         else:
             raise
     
-    # Add LICENSE
+    # Add LICENSE first (if not exists)
     license_content = """MIT License
 
 Copyright (c) 2025
@@ -261,58 +354,77 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE."""
     
-    # Create or update files
-    _upsert_file(repo, "index.html", "Update generated app", html_code)
     _upsert_file(repo, "LICENSE", "Ensure MIT LICENSE present", license_content)
-    _upsert_file(repo, "README.md", "Refresh README", readme_content)
+    
+    # Small delay to avoid rapid commits
+    time.sleep(1)
+    
+    # Update README
+    _upsert_file(repo, "README.md", f"Refresh README (Round {round_num})", readme_content)
+    
+    # Small delay
+    time.sleep(1)
+    
+    # Update main code
+    commit_msg = f"Update generated app (Round {round_num})" if round_num > 1 else "Add generated app"
+    _upsert_file(repo, "index.html", commit_msg, html_code)
+    
+    # Wait for commit to be processed
+    time.sleep(2)
     
     # Get commit SHA
     commit_sha = repo.get_commits()[0].sha
     
-    # Enable GitHub Pages using REST API directly
-    print("Enabling GitHub Pages...")
-    pages_enabled = False
-    for attempt in range(3):
-        try:
-            # Wait a moment for files to be committed
-            if attempt > 0:
-                time.sleep(2)
-            
-            # Use GitHub REST API to enable Pages
-            pages_url = f"https://api.github.com/repos/{github_username}/{repo_name}/pages"
-            headers = {
-                "Authorization": f"Bearer {github_token}",
-                "Accept": "application/vnd.github+json"
-            }
-            data = {
-                "source": {
-                    "branch": "main",
-                    "path": "/"
+    # Enable GitHub Pages using REST API directly (only if round 1)
+    if round_num == 1:
+        print("Enabling GitHub Pages...")
+        pages_enabled = False
+        for attempt in range(3):
+            try:
+                # Wait a moment for files to be committed
+                if attempt > 0:
+                    time.sleep(3)
+                
+                # Use GitHub REST API to enable Pages
+                pages_url = f"https://api.github.com/repos/{github_username}/{repo_name}/pages"
+                headers = {
+                    "Authorization": f"Bearer {github_token}",
+                    "Accept": "application/vnd.github+json"
                 }
-            }
-            
-            response = requests.post(pages_url, headers=headers, json=data, timeout=20)
-            
-            if response.status_code == 201:
-                print("✓ GitHub Pages enabled successfully")
-                pages_enabled = True
-                break
-            elif response.status_code == 409:
-                print("✓ GitHub Pages already enabled")
-                pages_enabled = True
-                break
-            else:
-                print(f"Attempt {attempt + 1}/3 failed: HTTP {response.status_code}")
+                data = {
+                    "source": {
+                        "branch": "main",
+                        "path": "/"
+                    }
+                }
+                
+                response = requests.post(pages_url, headers=headers, json=data, timeout=20)
+                
+                if response.status_code == 201:
+                    print("✓ GitHub Pages enabled successfully")
+                    pages_enabled = True
+                    break
+                elif response.status_code == 409:
+                    print("✓ GitHub Pages already enabled")
+                    pages_enabled = True
+                    break
+                else:
+                    print(f"Attempt {attempt + 1}/3 failed: HTTP {response.status_code}")
+                    if attempt == 2:
+                        print(f"⚠ Warning: {response.text}")
+                        
+            except Exception as e:
+                print(f"Attempt {attempt + 1}/3 to enable Pages failed: {e}")
                 if attempt == 2:
-                    print(f"⚠ Warning: {response.text}")
-                    
-        except Exception as e:
-            print(f"Attempt {attempt + 1}/3 to enable Pages failed: {e}")
-            if attempt == 2:
-                print("⚠ Warning: Could not enable Pages automatically. Enable manually in repo settings.")
-    
-    if not pages_enabled:
-        print("⚠ GitHub Pages may need manual activation")
+                    print("⚠ Warning: Could not enable Pages automatically. Enable manually in repo settings.")
+        
+        if not pages_enabled:
+            print("⚠ GitHub Pages may need manual activation")
+    else:
+        print("✓ GitHub Pages already configured (Round 2 update)")
+        # Trigger a rebuild by hitting the Pages API
+        print("✓ Waiting for GitHub Pages to rebuild...")
+        time.sleep(3)
     
     return {
         "repo_url": repo.html_url,
@@ -390,17 +502,27 @@ def deploy_app():
         
         github_client = get_github_client(config["github_token"])
 
+        # For round 2, fetch existing code
+        existing_code = None
+        if round_num > 1:
+            print(f"Fetching existing code for round {round_num}...")
+            existing_code = get_existing_code(task, config["github_username"], github_client)
+            if existing_code:
+                print(f"✓ Found existing code ({len(existing_code)} chars)")
+            else:
+                print("⚠ No existing code found, generating from scratch")
+
         # Generate app code using LLM
-        print("Generating app code...")
-        html_code = generate_app_code(brief, checks, attachments, config["aipipe_token"])
+        print(f"Generating app code (Round {round_num})...")
+        html_code = generate_app_code(brief, checks, attachments, config["aipipe_token"], round_num, existing_code)
         
         # Generate README
         print("Generating README...")
         repo_url = f"https://github.com/{config['github_username']}/{task}"
-        readme = generate_readme(task, brief, checks, repo_url, config["github_username"])
+        readme = generate_readme(task, brief, checks, repo_url, config["github_username"], round_num)
         
         # Create GitHub repo and deploy
-        print("Creating GitHub repo and deploying...")
+        print("Creating/updating GitHub repo and deploying...")
         github_info = create_github_repo(
             task,
             html_code,
@@ -408,11 +530,21 @@ def deploy_app():
             config["github_username"],
             config["github_token"],
             github_client,
+            round_num,
         )
         
-        print(f"✓ Repo created: {github_info['repo_url']}")
+        print(f"✓ Repo: {github_info['repo_url']}")
         print(f"✓ Commit SHA: {github_info['commit_sha']}")
         print(f"✓ Pages URL: {github_info['pages_url']}")
+        
+        # Wait for GitHub Pages to deploy and verify accessibility
+        print("\nWaiting for GitHub Pages to deploy...")
+        wait_time = 600 if round_num == 1 else 180  # 10 min for first deploy, 3 min for updates
+        pages_ready = wait_for_pages_deployment(github_info['pages_url'], max_wait=wait_time)
+        
+        if not pages_ready:
+            print(f"⚠ WARNING: Pages may not be ready after {wait_time}s, but continuing anyway")
+            print("   The evaluator may need to retry or wait longer for the page to be accessible")
         
         # Prepare notification payload
         notification = {
@@ -422,11 +554,12 @@ def deploy_app():
             "nonce": nonce,
             "repo_url": github_info['repo_url'],
             "commit_sha": github_info['commit_sha'],
-            "pages_url": github_info['pages_url']
+            "pages_url": github_info['pages_url'],
+            "pages_verified": pages_ready  # Include verification status
         }
         
         # Notify evaluator
-        print("Notifying evaluator...")
+        print("\nNotifying evaluator...")
         result = notify_evaluator(evaluation_url, notification)
         
         if result.get('success'):
@@ -435,7 +568,7 @@ def deploy_app():
             print(f"⚠ Evaluator notification failed: {result.get('error')}")
         
         print("=" * 70)
-        print(f"✅ Request completed successfully for {task}")
+        print(f"✅ Request completed successfully for {task} (Round {round_num})")
         print("=" * 70)
         print()
         
@@ -443,6 +576,7 @@ def deploy_app():
             "status": "success",
             "repo_url": github_info['repo_url'],
             "pages_url": github_info['pages_url'],
+            "pages_verified": pages_ready,
             "evaluator_response": result
         }), 200
         
