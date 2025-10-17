@@ -1,10 +1,12 @@
 from flask import Flask, request, jsonify
 import os
+import json
 import requests
 import time
-from github import Github, Auth, GithubException
+import hashlib
+from github import Github
+import base64
 import re
-from typing import Any, Dict, List, Optional
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
@@ -18,60 +20,17 @@ GITHUB_USERNAME = os.environ.get('GITHUB_USERNAME')
 YOUR_SECRET = os.environ.get('YOUR_SECRET')  # The secret you submitted in the form
 AIPIPE_TOKEN = os.environ.get('AIPIPE_TOKEN')  # AI Pipe token from aipipe.org/login
 
-_github_client: Optional[Github] = None
+# Initialize GitHub client
+github_client = Github(GITHUB_TOKEN)
 
 # AI Pipe configuration
 AIPIPE_BASE_URL = "https://aipipe.org/openrouter/v1/chat/completions"
 
-
-class ConfigurationError(Exception):
-    """Raised when required environment configuration is missing."""
-
-
-def mask_secret(value: Optional[str], visible_chars: int = 4) -> str:
-    """Mask secrets before logging them to stdout."""
-    if not value:
-        return "<missing>"
-    trimmed = value.strip()
-    if not trimmed:
-        return "<missing>"
-    length = len(trimmed)
-    if length <= visible_chars:
-        return "*" * length
-    visible = trimmed[:visible_chars]
-    return f"{visible}{'*' * (length - visible_chars)}"
-
-
-def get_config() -> Dict[str, str]:
-    """Collect required environment variables and ensure they exist."""
-    config_map: Dict[str, Optional[str]] = {
-        "github_token": os.environ.get("GITHUB_TOKEN"),
-        "github_username": os.environ.get("GITHUB_USERNAME"),
-        "secret": os.environ.get("YOUR_SECRET"),
-        "aipipe_token": os.environ.get("AIPIPE_TOKEN"),
-    }
-
-    missing = [name for name, value in config_map.items() if not value]
-    if missing:
-        raise ConfigurationError(
-            f"Missing required environment variables: {', '.join(sorted(missing))}"
-        )
-
-    return {key: config_map[key] or "" for key in config_map}
-
-
-def get_github_client(token: str) -> Github:
-    """Return a cached GitHub client authenticated with the provided token."""
-    global _github_client
-    if _github_client is None:
-        _github_client = Github(auth=Auth.Token(token))
-    return _github_client
-
-def verify_secret(request_data: Dict[str, Any], expected_secret: str) -> bool:
+def verify_secret(request_data):
     """Verify the secret matches"""
-    return request_data.get('secret') == expected_secret
+    return request_data.get('secret') == YOUR_SECRET
 
-def generate_app_code(brief: str, checks: List[str], attachments: Optional[List[Dict[str, Any]]], aipipe_token: str) -> str:
+def generate_app_code(brief, checks, attachments):
     """Use Claude via AI Pipe to generate the complete app code"""
     
     # Prepare attachment info for Claude
@@ -79,9 +38,7 @@ def generate_app_code(brief: str, checks: List[str], attachments: Optional[List[
     if attachments:
         attachment_info = "\n\nAttachments:\n"
         for att in attachments:
-            name = att.get('name', 'Attachment')
-            url = att.get('url', 'N/A')
-            attachment_info += f"- {name}: {str(url)[:100]}...\n"
+            attachment_info += f"- {att['name']}: {att['url'][:100]}...\n"
     
     # Build the prompt
     prompt = f"""You are an expert web developer. Generate a COMPLETE, PRODUCTION-READY single HTML file for this app.
@@ -111,7 +68,7 @@ Start directly with <!DOCTYPE html>"""
     response = requests.post(
         AIPIPE_BASE_URL,
         headers={
-            "Authorization": f"Bearer {aipipe_token}",
+            "Authorization": f"Bearer {AIPIPE_TOKEN}",
             "Content-Type": "application/json"
         },
         json={
@@ -125,19 +82,7 @@ Start directly with <!DOCTYPE html>"""
     response.raise_for_status()
     result = response.json()
     
-    choices = result.get('choices')
-    if not choices:
-        raise RuntimeError("AI Pipe response did not include any choices")
-
-    code_block = choices[0]
-    message = code_block.get('message', {})
-    content = message.get('content')
-    if isinstance(content, list):
-        content = "".join(block.get("text", "") for block in content)
-    if not isinstance(content, str):
-        raise RuntimeError("AI Pipe response missing text content")
-
-    code = content.strip()
+    code = result['choices'][0]['message']['content'].strip()
     
     # Clean up if Claude wrapped it in markdown
     if code.startswith('```'):
@@ -145,7 +90,7 @@ Start directly with <!DOCTYPE html>"""
     
     return code
 
-def generate_readme(task_id: str, brief: str, checks: List[str], repo_url: str, github_username: str) -> str:
+def generate_readme(task_id, brief, checks, repo_url):
     """Generate a professional README.md"""
     
     readme = f"""# {task_id}
@@ -163,7 +108,7 @@ This is an automated web application generated to fulfill the following requirem
 This is a static web application hosted on GitHub Pages. No installation required.
 
 ## Usage
-1. Visit the live site: [GitHub Pages URL](https://{github_username}.github.io/{task_id}/)
+1. Visit the live site: [GitHub Pages URL](https://{GITHUB_USERNAME}.github.io/{task_id}/)
 2. The application loads automatically
 3. Follow on-screen instructions
 
@@ -184,38 +129,14 @@ MIT License - See LICENSE file for details
 
 ## Author
 Generated automatically via LLM-assisted development
-Repository: {repo_url}
+
+**Source Code:** https://github.com/{GITHUB_USERNAME}/llm-deployment-api
+
+**Generated App:** {repo_url}
 """
     return readme
 
-def _upsert_file(repo, path: str, message: str, content: str) -> None:
-    """Create or update a file in the repository."""
-    try:
-        existing = repo.get_contents(path)
-    except GithubException as exc:
-        if exc.status == 404:
-            existing = None
-        else:
-            raise
-
-    if existing:
-        current = existing.decoded_content.decode("utf-8")
-        if current == content:
-            # No change needed; avoid unnecessary commits
-            return
-        repo.update_file(path, message, content, existing.sha)
-    else:
-        repo.create_file(path, message, content)
-
-
-def create_github_repo(
-    task_id: str,
-    html_code: str,
-    readme_content: str,
-    github_username: str,
-    github_token: str,
-    github_client: Github,
-):
+def create_github_repo(task_id, html_code, readme_content):
     """Create repo, push code, enable Pages"""
     
     user = github_client.get_user()
@@ -229,11 +150,9 @@ def create_github_repo(
             private=False,
             auto_init=False
         )
-    except GithubException as exc:
-        if exc.status in (422, 403):
-            repo = user.get_repo(repo_name)
-        else:
-            raise
+    except Exception as e:
+        # Repo might exist, try to get it
+        repo = user.get_repo(repo_name)
     
     # Add LICENSE
     license_content = """MIT License
@@ -258,10 +177,10 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE."""
     
-    # Create or update files
-    _upsert_file(repo, "index.html", "Update generated app", html_code)
-    _upsert_file(repo, "LICENSE", "Ensure MIT LICENSE present", license_content)
-    _upsert_file(repo, "README.md", "Refresh README", readme_content)
+    # Create files
+    repo.create_file("index.html", "Initial commit: Add app", html_code)
+    repo.create_file("LICENSE", "Add MIT LICENSE", license_content)
+    repo.create_file("README.md", "Add README", readme_content)
     
     # Get commit SHA
     commit_sha = repo.get_commits()[0].sha
@@ -276,9 +195,9 @@ SOFTWARE."""
                 time.sleep(2)
             
             # Use GitHub REST API to enable Pages
-            pages_url = f"https://api.github.com/repos/{github_username}/{repo_name}/pages"
+            pages_url = f"https://api.github.com/repos/{GITHUB_USERNAME}/{repo_name}/pages"
             headers = {
-                "Authorization": f"Bearer {github_token}",
+                "Authorization": f"token {GITHUB_TOKEN}",
                 "Accept": "application/vnd.github+json"
             }
             data = {
@@ -288,7 +207,7 @@ SOFTWARE."""
                 }
             }
             
-            response = requests.post(pages_url, headers=headers, json=data, timeout=20)
+            response = requests.post(pages_url, headers=headers, json=data)
             
             if response.status_code == 201:
                 print("✓ GitHub Pages enabled successfully")
@@ -314,7 +233,7 @@ SOFTWARE."""
     return {
         "repo_url": repo.html_url,
         "commit_sha": commit_sha,
-        "pages_url": f"https://{github_username}.github.io/{repo_name}/"
+        "pages_url": f"https://{GITHUB_USERNAME}.github.io/{repo_name}/"
     }
 
 def notify_evaluator(evaluation_url, payload, max_retries=5):
@@ -346,20 +265,11 @@ def deploy_app():
     """Main endpoint that handles app deployment requests"""
     
     try:
-        config = get_config()
-        request_data = request.get_json(silent=True)
-        
-        if not request_data:
-            return jsonify({"error": "Invalid JSON payload"}), 400
+        request_data = request.get_json()
         
         # Verify secret
-        if not verify_secret(request_data, config["secret"]):
+        if not verify_secret(request_data):
             return jsonify({"error": "Invalid secret"}), 403
-
-        required_fields = ["email", "task", "round", "nonce", "brief", "checks", "evaluation_url"]
-        missing_fields = [field for field in required_fields if field not in request_data]
-        if missing_fields:
-            return jsonify({"error": f"Missing fields: {', '.join(sorted(missing_fields))}"}), 400
         
         # Extract data
         email = request_data['email']
@@ -370,42 +280,22 @@ def deploy_app():
         checks = request_data['checks']
         evaluation_url = request_data['evaluation_url']
         attachments = request_data.get('attachments', [])
-
-        if not isinstance(checks, list) or not all(isinstance(item, str) for item in checks):
-            return jsonify({"error": "'checks' must be a list of strings"}), 400
-
-        if attachments is None:
-            attachments = []
-        if not isinstance(attachments, list):
-            return jsonify({"error": "'attachments' must be a list"}), 400
-        if attachments and not all(isinstance(att, dict) for att in attachments):
-            return jsonify({"error": "'attachments' items must be objects"}), 400
         
         print("=" * 70)
         print(f"📥 Processing request for {email}, task: {task}, round: {round_num}")
         print("=" * 70)
         
-        github_client = get_github_client(config["github_token"])
-
         # Generate app code using LLM
         print("Generating app code...")
-        html_code = generate_app_code(brief, checks, attachments, config["aipipe_token"])
+        html_code = generate_app_code(brief, checks, attachments)
         
         # Generate README
         print("Generating README...")
-        repo_url = f"https://github.com/{config['github_username']}/{task}"
-        readme = generate_readme(task, brief, checks, repo_url, config["github_username"])
+        readme = generate_readme(task, brief, checks, f"https://github.com/{GITHUB_USERNAME}/{task}")
         
         # Create GitHub repo and deploy
         print("Creating GitHub repo and deploying...")
-        github_info = create_github_repo(
-            task,
-            html_code,
-            readme,
-            config["github_username"],
-            config["github_token"],
-            github_client,
-        )
+        github_info = create_github_repo(task, html_code, readme)
         
         print(f"✓ Repo created: {github_info['repo_url']}")
         print(f"✓ Commit SHA: {github_info['commit_sha']}")
@@ -457,20 +347,18 @@ def health_check():
 
 if __name__ == '__main__':
     # Check environment variables
-    try:
-        config = get_config()
-    except ConfigurationError as exc:
-        print("ERROR:", exc)
-        print("Required environment variables: GITHUB_TOKEN, GITHUB_USERNAME, YOUR_SECRET, AIPIPE_TOKEN")
+    if not all([GITHUB_TOKEN, GITHUB_USERNAME, YOUR_SECRET, AIPIPE_TOKEN]):
+        print("ERROR: Missing environment variables!")
+        print("Required: GITHUB_TOKEN, GITHUB_USERNAME, YOUR_SECRET, AIPIPE_TOKEN")
         exit(1)
     
     print("=" * 70)
     print("🚀 LLM Deployment API Starting...")
     print("=" * 70)
-    print(f"GitHub Username: {config['github_username']}")
-    print(f"Secret: {mask_secret(config['secret'])} (configured)")
-    print(f"AI Pipe Token: {mask_secret(config['aipipe_token'])} (configured)")
-    print(f"GitHub Token: {mask_secret(config['github_token'])} (configured)")
+    print(f"GitHub Username: {GITHUB_USERNAME}")
+    print(f"Secret: {'*' * len(YOUR_SECRET)} (configured)")
+    print(f"AI Pipe Token: {'*' * 20}... (configured)")
+    print(f"GitHub Token: {'*' * 20}... (configured)")
     print("=" * 70)
     print()
     
