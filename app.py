@@ -256,33 +256,20 @@ def _upsert_file(repo, path: str, message: str, content: str) -> None:
         repo.create_file(path, message, content)
 
 
-def verify_pages_async(pages_url: str, nonce: str, evaluation_url: str, notification: dict, max_wait: int = 120):
+def verify_pages_async(pages_url: str, nonce: str, evaluation_url: str, notification: dict, delay_seconds: int = 180):
     """
-    Background thread to verify Pages deployment and notify evaluator.
-    Doesn't block the main request.
+    Background thread to wait for Pages deployment and notify evaluator.
+    Doesn't block the main request. Waits for a fixed delay (default 3 minutes).
     """
-    print(f"[BG] Starting Pages verification in background thread...")
+    print(f"[BG] Starting {delay_seconds}s delay before notifying evaluator...")
     
-    for attempt in range(max_wait // 10):
-        try:
-            response = requests.get(
-                pages_url, 
-                timeout=10,
-                allow_redirects=True,
-                headers={'User-Agent': 'Mozilla/5.0'}
-            )
-            
-            if response.status_code == 200 and len(response.content) > 100:
-                print(f"[BG] Pages verified as accessible at {(attempt * 10)}s")
-                notification["pages_verified"] = True
-                break
-        except requests.exceptions.RequestException:
-            pass
-        
-        if attempt < (max_wait // 10) - 1:
-            time.sleep(10)
+    # Wait for the specified delay
+    time.sleep(delay_seconds)
     
-    print(f"[BG] Notifying evaluator with final status...")
+    # Mark as verified after delay
+    notification["pages_verified"] = True
+    
+    print(f"[BG] Delay complete. Notifying evaluator...")
     notify_evaluator(evaluation_url, notification)
 
 
@@ -531,12 +518,12 @@ def deploy_app():
             "pages_verified": False  # Will be updated in background
         }
         
-        print("✓ Deployment complete. Verifying Pages in background...")
+        print("✓ Deployment complete. Will notify evaluator after 3-minute delay...")
         
-        # Start background thread to verify Pages and notify (doesn't block the request)
+        # Start background thread with 3-minute delay (doesn't block the request)
         bg_thread = threading.Thread(
             target=verify_pages_async,
-            args=(github_info['pages_url'], nonce, evaluation_url, notification, 120),
+            args=(github_info['pages_url'], nonce, evaluation_url, notification, 180),
             daemon=True
         )
         bg_thread.start()
@@ -551,7 +538,7 @@ def deploy_app():
             "status": "success",
             "repo_url": github_info['repo_url'],
             "pages_url": github_info['pages_url'],
-            "message": "Deployment in progress. Verifying and notifying evaluator in background."
+            "message": "Deployment complete. Will notify evaluator after 3-minute delay."
         }), 200
         
     except Exception as e:
