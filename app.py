@@ -272,7 +272,7 @@ def verify_pages_async(pages_url: str, nonce: str, evaluation_url: str, notifica
         time_remaining = deadline - current_time
         
         if time_remaining > 5:  # Only wait if we have more than 5 seconds
-            wait_time = max(5, time_remaining)  # Wait at least 5 seconds for Pages to deploy
+            wait_time = min(60, time_remaining)  # Wait up to 60 seconds for Pages, but not past deadline
             print(f"[BG] Waiting {wait_time:.1f}s for Pages deployment (deadline in {deadline - current_time:.1f}s)...")
             time.sleep(wait_time)
         else:
