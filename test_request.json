@@ -1,0 +1,16 @@
+{
+  "email": "test@example.com",
+  "secret": "YOUR_SECRET_HERE",
+  "task": "sum-of-sales-test123",
+  "round": 1,
+  "nonce": "test-nonce-abc123",
+  "brief": "Create a Bootstrap 5 page that displays 'Sales Summary 2025' as the title, has a heading with 'Total Sales Dashboard', and shows a total of $12,345.67 inside a div with id='total-sales'. Use Bootstrap classes for styling.",
+  "checks": [
+    "Page has Bootstrap 5 loaded from CDN",
+    "Page title contains 'Sales Summary'",
+    "Element #total-sales exists and displays a number",
+    "Page uses Bootstrap styling"
+  ],
+  "evaluation_url": "https://httpbin.org/post",
+  "attachments": []
+}
