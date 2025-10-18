@@ -155,7 +155,6 @@ Return ONLY the complete MODIFIED HTML code, nothing else. No explanations, no m
 Start directly with <!DOCTYPE html>"""
 
     # Call AI Pipe with OpenRouter (Claude via OpenRouter)
-    # Reduced timeout to ensure we don't exceed our time budget
     response = requests.post(
         AIPIPE_BASE_URL,
         headers={
@@ -167,7 +166,7 @@ Start directly with <!DOCTYPE html>"""
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": 8000
         },
-        timeout=90  # Reduced from 120 to 90 seconds
+        timeout=90
     )
     
     response.raise_for_status()
@@ -261,6 +260,37 @@ def _upsert_file(repo, path: str, message: str, content: str) -> None:
         repo.create_file(path, message, content)
 
 
+def notify_evaluator(evaluation_url, payload, max_retries=5):
+    """POST to evaluation URL with exponential backoff as per guidelines"""
+    
+    for attempt in range(max_retries):
+        try:
+            response = requests.post(
+                evaluation_url,
+                json=payload,
+                headers={"Content-Type": "application/json"},
+                timeout=15
+            )
+            
+            if response.status_code == 200:
+                print(f"✓ Evaluator notified successfully (attempt {attempt + 1})")
+                return {"success": True}
+            else:
+                print(f"⚠ Evaluator returned status {response.status_code} (attempt {attempt + 1})")
+            
+        except Exception as e:
+            print(f"⚠ Notification attempt {attempt + 1}/{max_retries} failed: {e}")
+        
+        # Exponential backoff: 1, 2, 4, 8 seconds
+        if attempt < max_retries - 1:
+            backoff = 2 ** attempt  # 1, 2, 4, 8, 16
+            print(f"   Retrying in {backoff}s...")
+            time.sleep(backoff)
+    
+    print(f"❌ Failed to notify evaluator after {max_retries} attempts")
+    return {"success": False, "error": "Max retries exceeded"}
+
+
 def verify_pages_async(pages_url: str, nonce: str, evaluation_url: str, notification: dict, start_time: float, deadline: float):
     """
     Background thread to wait for Pages deployment and notify evaluator.
@@ -272,7 +302,7 @@ def verify_pages_async(pages_url: str, nonce: str, evaluation_url: str, notifica
         time_remaining = deadline - current_time
         
         if time_remaining > 5:  # Only wait if we have more than 5 seconds
-            wait_time = min(60, time_remaining)  # Wait up to 60 seconds for Pages, but not past deadline
+            wait_time = min(60, time_remaining)  # Wait up to 60 seconds for Pages
             print(f"[BG] Waiting {wait_time:.1f}s for Pages deployment (deadline in {deadline - current_time:.1f}s)...")
             time.sleep(wait_time)
         else:
@@ -282,20 +312,17 @@ def verify_pages_async(pages_url: str, nonce: str, evaluation_url: str, notifica
         if time.time() >= deadline:
             print(f"[BG] ⚠️ Deadline reached! Notifying immediately...")
         
-        # Mark as verified
-        notification["pages_verified"] = True
-        
         elapsed = time.time() - start_time
         print(f"[BG] Notifying evaluator (total elapsed: {elapsed:.1f}s)...")
         
-        # Notify with minimal retries to stay under deadline
-        result = notify_evaluator(evaluation_url, notification, max_retries=2)
+        # Notify with retries (guidelines say to retry with exponential backoff)
+        result = notify_evaluator(evaluation_url, notification, max_retries=5)
         
         final_elapsed = time.time() - start_time
         print(f"[BG] ✓ Notification complete (total time: {final_elapsed:.1f}s / {MAX_TOTAL_TIME}s budget)")
         
         if not result["success"]:
-            print(f"[BG] ⚠️ Warning: Notification may have failed but we stayed under time limit")
+            print(f"[BG] ⚠️ Warning: Notification may have failed")
             
     except Exception as e:
         print(f"[BG] ❌ Error in background thread: {e}")
@@ -379,11 +406,11 @@ SOFTWARE."""
     if round_num == 1:
         print("Enabling GitHub Pages...")
         pages_enabled = False
-        for attempt in range(2):  # Reduced from 3 to 2 attempts
+        for attempt in range(2):
             try:
                 # Wait a moment for files to be committed
                 if attempt > 0:
-                    time.sleep(2)  # Reduced from 3 to 2
+                    time.sleep(2)
                 
                 # Use GitHub REST API to enable Pages
                 pages_url = f"https://api.github.com/repos/{github_username}/{repo_name}/pages"
@@ -398,7 +425,7 @@ SOFTWARE."""
                     }
                 }
                 
-                response = requests.post(pages_url, headers=headers, json=data, timeout=15)  # Reduced from 20 to 15
+                response = requests.post(pages_url, headers=headers, json=data, timeout=15)
                 
                 if response.status_code == 201:
                     print("✓ GitHub Pages enabled successfully")
@@ -429,33 +456,6 @@ SOFTWARE."""
         "pages_url": f"https://{github_username}.github.io/{repo_name}/"
     }
 
-def notify_evaluator(evaluation_url, payload, max_retries=2):
-    """POST to evaluation URL with minimal retries (time-constrained)"""
-    
-    for attempt in range(max_retries):
-        try:
-            response = requests.post(
-                evaluation_url,
-                json=payload,
-                headers={"Content-Type": "application/json"},
-                timeout=10  # Reduced from 30 to 10 seconds
-            )
-            
-            if response.status_code == 200:
-                print(f"✓ Evaluator notified successfully")
-                return {"success": True, "response": response.json()}
-            else:
-                print(f"⚠ Evaluator returned status {response.status_code}")
-            
-        except Exception as e:
-            print(f"Attempt {attempt + 1}/{max_retries} failed: {e}")
-        
-        # Short backoff: 2 seconds only
-        if attempt < max_retries - 1:
-            time.sleep(2)
-    
-    print(f"❌ Failed to notify evaluator after {max_retries} attempts")
-    return {"success": False, "error": "Max retries exceeded"}
 
 @app.route('/api/deploy', methods=['POST'])
 def deploy_app():
@@ -558,7 +558,7 @@ def deploy_app():
         print(f"⏱️  Processing completed in {elapsed_time:.1f}s")
         print(f"⏱️  Time remaining until deadline: {time_remaining:.1f}s")
         
-        # Prepare notification payload
+        # Prepare notification payload (FIXED: removed pages_verified)
         notification = {
             "email": email,
             "task": task,
@@ -566,8 +566,7 @@ def deploy_app():
             "nonce": nonce,
             "repo_url": github_info['repo_url'],
             "commit_sha": github_info['commit_sha'],
-            "pages_url": github_info['pages_url'],
-            "pages_verified": False  # Will be updated in background
+            "pages_url": github_info['pages_url']
         }
         
         print(f"✓ Starting background notification thread with hard deadline...")
